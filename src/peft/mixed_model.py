@@ -394,11 +394,85 @@ class PeftMixedModel(PushToHubMixin, torch.nn.Module):
     def save_pretrained(
         self,
         save_directory: str,
-        safe_serialization: bool = False,
+        safe_serialization: bool = True,
         selected_adapters: Optional[list[str]] = None,
         **kwargs: Any,
     ):
-        raise NotImplementedError(f"Saving is not supported for {self.__class__.__name__} (yet).")
+        """
+        Saves the adapter weights and configurations to a directory.
+
+        Args:
+            save_directory (str): 目标保存目录（不存在则自动创建）。
+            safe_serialization (bool, optional): 是否使用safetensors格式保存参数，默认True。
+            selected_adapters (list[str], optional): 指定需要保存的adapter列表。如果为None，则保存所有adapter。
+            **kwargs: 额外参数，传递给底层的保存函数。
+        """
+        if os.path.isfile(save_directory):
+            raise ValueError(f"save_pretrained received a file path ({save_directory}), should be a directory.")
+
+        if selected_adapters is None:
+            selected_adapters = list(self.peft_config.keys())
+        else:
+            # 检查所选adapter是否都在peft_config中存在
+            missing = [ad for ad in selected_adapters if ad not in self.peft_config]
+            if missing:
+                raise ValueError(
+                    f"Cannot save these adapters {missing}, as they are not found in the current model. "
+                    f"Available adapters: {list(self.peft_config.keys())}"
+                )
+
+        os.makedirs(save_directory, exist_ok=True)
+
+        # 获取模型状态字典，包括基础模型参数和多个adapter的参数
+        state_dict = self.state_dict()
+
+        # 遍历要保存的adapter
+        for adapter_name in selected_adapters:
+            adapter_config = self.peft_config[adapter_name]
+
+            # 从state_dict中提取该adapter相关的参数
+            adapter_state_dict = {k: v for k, v in state_dict.items() if adapter_name in k}
+
+            # 为了保持一致性，我们在一个子目录中保存adapter参数和配置
+            # 若adapter_name为"default"，则直接在save_directory中保存
+            adapter_save_dir = os.path.join(save_directory, adapter_name) if adapter_name != "default" else save_directory
+            os.makedirs(adapter_save_dir, exist_ok=True)
+
+            # 保存参数
+            if safe_serialization:
+                from safetensors.torch import save_file as safe_save_file
+                # 为了避免safetensors的alias问题，我们clone共享的张量
+                ptr_map = {}
+                for name, tensor in adapter_state_dict.items():
+                    if isinstance(tensor, torch.Tensor):
+                        ptr = (id(tensor.storage()), tensor.storage_offset(), tensor.size())
+                        ptr_map.setdefault(ptr, []).append(name)
+
+                for ptr, names in ptr_map.items():
+                    if len(names) > 1:
+                        for n in names[1:]:
+                            adapter_state_dict[n] = adapter_state_dict[n].clone()
+
+                safe_path = os.path.join(adapter_save_dir, "adapter_model.safetensors")
+                safe_save_file(adapter_state_dict, safe_path)
+            else:
+                torch.save(adapter_state_dict, os.path.join(adapter_save_dir, "adapter_model.bin"))
+
+            # 更新adapter_config中的base_model_name_or_path以便于之后加载
+            if adapter_config.base_model_name_or_path is None:
+                # mixed model的base_model可能属性名字稍有不同，需要根据情况修改
+                adapter_config.base_model_name_or_path = getattr(self.base_model.model, "name_or_path", None)
+
+            # 修改inference_mode为True以便推理使用
+            inference_mode = adapter_config.inference_mode
+            adapter_config.inference_mode = True
+
+            # 保存adapter配置
+            adapter_config.save_pretrained(adapter_save_dir)
+            # 恢复inference_mode原值
+            adapter_config.inference_mode = inference_mode
+
+        print(f"Adapters {selected_adapters} saved to {save_directory}")
 
     @classmethod
     def from_pretrained(
